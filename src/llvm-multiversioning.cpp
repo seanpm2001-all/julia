@@ -40,9 +40,6 @@
 
 using namespace llvm;
 
-extern std::pair<MDNode*,MDNode*> tbaa_make_child(const char *name, MDNode *parent=nullptr,
-                                                  bool isConstant=false);
-
 namespace {
 
 // These are valid detail cloning conditions in the target flags.
@@ -343,7 +340,7 @@ CloneCtx::CloneCtx(MultiVersioning *pass, Module &M)
       T_void(Type::getVoidTy(ctx)),
       T_psize(PointerType::get(T_size, 0)),
       T_pvoidfunc(FunctionType::get(T_void, false)->getPointerTo()),
-      tbaa_const(tbaa_make_child("jtbaa_const", nullptr, true).first),
+      tbaa_const(tbaa_make_child_with_context(ctx, "jtbaa_const", nullptr, true).first),
       pass(pass),
       specs(jl_get_llvm_clone_targets()),
       fvars(consume_gv<Function>(M, "jl_sysimg_fvars")),
