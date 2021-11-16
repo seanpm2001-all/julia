@@ -83,19 +83,6 @@ void jl_module_run_initializer(jl_module_t *m)
     }
 }
 
-static void jl_register_root_module(jl_module_t *m)
-{
-    static jl_value_t *register_module_func = NULL;
-    assert(jl_base_module);
-    if (register_module_func == NULL)
-        register_module_func = jl_get_global(jl_base_module, jl_symbol("register_root_module"));
-    assert(register_module_func);
-    jl_value_t *args[2];
-    args[0] = register_module_func;
-    args[1] = (jl_value_t*)m;
-    jl_apply(args, 2);
-}
-
 jl_array_t *jl_get_loaded_modules(void)
 {
     static jl_value_t *loaded_modules_array = NULL;
@@ -104,12 +91,6 @@ jl_array_t *jl_get_loaded_modules(void)
     if (loaded_modules_array != NULL)
         return (jl_array_t*)jl_call0((jl_function_t*)loaded_modules_array);
     return NULL;
-}
-
-static int jl_is__toplevel__mod(jl_module_t *mod)
-{
-    return jl_base_module &&
-        (jl_value_t*)mod == jl_get_global(jl_base_module, jl_symbol("__toplevel__"));
 }
 
 // TODO: add locks around global state mutation operations
@@ -131,42 +112,50 @@ static jl_value_t *jl_eval_module_expr(jl_module_t *parent_module, jl_expr_t *ex
         jl_type_error("module", (jl_value_t*)jl_symbol_type, (jl_value_t*)name);
     }
 
-    jl_module_t *newm = jl_new_module(name);
-    jl_value_t *form = (jl_value_t*)newm;
+    jl_value_t *form = NULL; // temporary root
     JL_GC_PUSH1(&form);
-    JL_LOCK(&jl_modules_mutex);
-    ptrhash_put(&jl_current_modules, (void*)newm, (void*)((uintptr_t)HT_NOTFOUND + 1));
-    JL_UNLOCK(&jl_modules_mutex);
 
-    // copy parent environment info into submodule
-    newm->uuid = parent_module->uuid;
-    if (jl_is__toplevel__mod(parent_module)) {
-        newm->parent = newm;
-        jl_register_root_module(newm);
+    jl_binding_t *b = jl_get_binding_wr(parent_module, name, 1);
+    jl_module_t *newm;
+    if (parent_module->name == name && b->value == (jl_value_t*)parent_module) {
+        newm = parent_module; // deprecate this (to an error) in v2?
     }
     else {
+        newm = jl_new_module(name);
+        // copy parent environment info into submodule
+        newm->uuid = parent_module->uuid;
         newm->parent = parent_module;
-        jl_binding_t *b = jl_get_binding_wr(parent_module, name, 1);
-        jl_declare_constant(b);
         jl_value_t *old = NULL;
-        if (!jl_atomic_cmpswap(&b->value, &old, (jl_value_t*)newm)) {
-            if (!jl_is_module(old)) {
+        jl_declare_constant(b);
+        while (!jl_atomic_cmpswap(&b->value, &old, (jl_value_t*)newm)) {
+            if (!jl_is_module(old))
                 jl_errorf("invalid redefinition of constant %s", jl_symbol_name(name));
-            }
             if (jl_generating_output())
                 jl_errorf("cannot replace module %s during compilation", jl_symbol_name(name));
-            jl_printf(JL_STDERR, "WARNING: replacing module %s.\n", jl_symbol_name(name));
-            old = jl_atomic_exchange(&b->value, (jl_value_t*)newm);
         }
         jl_gc_wb_binding(b, newm);
         if (old != NULL) {
+            form = (jl_value_t*)old; // temporary root
             // create a hidden gc root for the old module
             JL_LOCK(&jl_modules_mutex);
             uintptr_t *refcnt = (uintptr_t*)ptrhash_bp(&jl_current_modules, (void*)old);
             *refcnt += 1;
             JL_UNLOCK(&jl_modules_mutex);
+            form = NULL;
+            jl_printf(JL_STDERR, "WARNING: replacing module %s.\n", jl_symbol_name(name));
         }
     }
+
+    JL_LOCK(&jl_modules_mutex);
+    uintptr_t *refcnt = (uintptr_t*)ptrhash_bp(&jl_current_modules, (void*)newm);
+    if (*refcnt != (uintptr_t)HT_NOTFOUND)
+        newm = NULL;
+    else
+        *refcnt += 1;
+    JL_UNLOCK(&jl_modules_mutex);
+    form = NULL;
+    if (newm == NULL)
+        jl_errorf("invalid redefinition of constant %s", jl_symbol_name(name));
 
     if (parent_module == jl_main_module && name == jl_symbol("Base")) {
         // pick up Base module during bootstrap
@@ -219,21 +208,22 @@ static jl_value_t *jl_eval_module_expr(jl_module_t *parent_module, jl_expr_t *ex
 #endif
 
     JL_LOCK(&jl_modules_mutex);
-    uintptr_t *refcnt = (uintptr_t*)ptrhash_bp(&jl_current_modules, (void*)newm);
+    refcnt = (uintptr_t*)ptrhash_bp(&jl_current_modules, (void*)newm);
     assert(*refcnt > (uintptr_t)HT_NOTFOUND);
     *refcnt -= 1;
     // newm should be reachable from somewhere else by now
 
     if (jl_module_init_order == NULL)
         jl_module_init_order = jl_alloc_vec_any(0);
-    jl_array_ptr_1d_push(jl_module_init_order, (jl_value_t*)newm);
+    if (!jl_generating_output() || newm != newm->parent) // otherwise it was already in here
+        jl_array_ptr_1d_push(jl_module_init_order, (jl_value_t*)newm);
 
     // defer init of children until parent is done being defined
     // then initialize all in definition-finished order
     // at build time, don't run them at all (defer for runtime)
     form = NULL;
     if (!jl_generating_output()) {
-        if (!ptrhash_has(&jl_current_modules, (void*)newm->parent)) {
+        if (newm == newm->parent || !ptrhash_has(&jl_current_modules, (void*)newm->parent)) {
             size_t i, l = jl_array_len(jl_module_init_order);
             size_t ns = 0;
             form = (jl_value_t*)jl_alloc_vec_any(0);
@@ -264,6 +254,27 @@ static jl_value_t *jl_eval_module_expr(jl_module_t *parent_module, jl_expr_t *ex
     JL_GC_POP();
     return (jl_value_t*)newm;
 }
+
+jl_module_t *jl_new_module_(jl_sym_t *name, uint8_t default_names);
+
+JL_DLLEXPORT jl_value_t *jl_f_new_module(jl_sym_t *name, uint8_t std_imports, uint8_t default_names)
+{
+    jl_module_t *m = jl_new_module_(name, default_names);
+    JL_GC_PUSH1(&m);
+    m->parent = m;
+    jl_gc_wb(m, m->parent);
+    if (std_imports)
+        jl_add_standard_imports(m);
+    JL_LOCK(&jl_modules_mutex);
+    if (jl_module_init_order == NULL)
+        jl_module_init_order = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(jl_module_init_order, (jl_value_t*)m);
+    JL_UNLOCK(&jl_modules_mutex);
+    // TODO: should we somehow try to gc-root this correctly?
+    JL_GC_POP();
+    return (jl_value_t*)m;
+}
+
 
 static jl_value_t *jl_eval_dot_expr(jl_module_t *m, jl_value_t *x, jl_value_t *f, int fast)
 {
@@ -914,7 +925,7 @@ static void jl_check_open_for(jl_module_t *m, const char* funcname)
                 }
             }
             JL_UNLOCK(&jl_modules_mutex);
-            if (!open && !jl_is__toplevel__mod(m)) {
+            if (!open) {
                 const char* name = jl_symbol_name(m->name);
                 jl_errorf("Evaluation into the closed module `%s` breaks incremental compilation "
                           "because the side effects will not be permanent. "

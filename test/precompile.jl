@@ -264,7 +264,7 @@ precompile_test_harness(false) do dir
     # the module doesn't reload from the image:
     @test_warn "@ccallable was already defined for this method name" begin
         @test_logs (:warn, "Replacing module `$Foo_module`") begin
-            ms = Base._require_from_serialized(cachefile)
+            ms = @lock Base.require_lock Base._require_from_serialized(cachefile)
             @test isa(ms, Array{Any,1})
         end
     end
@@ -304,7 +304,7 @@ precompile_test_harness(false) do dir
             Dict(let m = Base.PkgId(s)
                     m => Base.module_build_id(Base.root_module(m))
                  end for s in
-                 [ "Base", "Core", "Main",
+                 [ "Base", "Core",
                    string(Foo2_module), string(FooBase_module) ]),
             # plus modules included in the system image
             Dict(let m = Base.root_module(Base, s)
