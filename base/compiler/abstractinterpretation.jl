@@ -203,7 +203,7 @@ function find_matching_methods(argtypes::Vector{Any}, @nospecialize(atype), meth
             mt = ccall(:jl_method_table_for, Any, (Any,), sig_n)
             mt === nothing && return FailedMethodMatch("Could not identify method table for call")
             mt = mt::Core.MethodTable
-            matches = findall(sig_n, method_table; limit = max_methods)
+            matches = find_all_matches(sig_n, method_table; limit = max_methods)
             if matches === missing
                 return FailedMethodMatch("For one of the union split cases, too many methods matched")
             end
@@ -239,7 +239,7 @@ function find_matching_methods(argtypes::Vector{Any}, @nospecialize(atype), meth
             return FailedMethodMatch("Could not identify method table for call")
         end
         mt = mt::Core.MethodTable
-        matches = findall(atype, method_table; limit = max_methods)
+        matches = find_all_matches(atype, method_table; limit = max_methods)
         if matches === missing
             # this means too many methods matched
             # (assume this will always be true, so we don't compute / update valid age in this case)
@@ -1326,7 +1326,7 @@ function abstract_invoke(interp::AbstractInterpreter, (; fargs, argtypes)::ArgIn
     types = rewrap_unionall(Tuple{ft, unwrap_unionall(types).parameters...}, types)::Type
     nargtype = Tuple{ft, nargtype.parameters...}
     argtype = Tuple{ft, argtype.parameters...}
-    result = findsup(types, method_table(interp))
+    result = find_supremum_match(types, method_table(interp))
     result === nothing && return CallMeta(Any, false)
     method, valid_worlds = result
     update_valid_age!(sv, valid_worlds)
