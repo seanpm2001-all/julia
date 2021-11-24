@@ -340,7 +340,7 @@ to get the file name part of the path.
 """
 function pathof(m::Module)
     @lock require_lock begin
-    pkgid = get(module_keys, m, nothing)
+    pkgid = PkgId(m)
     pkgid === nothing && return nothing
     origin = get(pkgorigins, pkgid, nothing)
     origin === nothing && return nothing
@@ -1066,14 +1066,16 @@ function require(uuidkey::PkgId)
 end
 
 const loaded_modules = Dict{PkgId,Module}()
-const module_keys = IdDict{Module,PkgId}() # the reverse
 
-is_root_module(m::Module) = @lock require_lock haskey(module_keys, m)
-root_module_key(m::Module) = @lock require_lock module_keys[m]
+function PkgId(m::Module)
+    # FIXME: Base is not formally a root module currently (its parent is Main)
+    name = m === Base ? "Base" : String(nameof(moduleroot(m)))
+    uuid = UUID(ccall(:jl_module_uuid, NTuple{2, UInt64}, (Any,), m))
+    UInt128(uuid) == 0 ? PkgId(name) : PkgId(uuid, name)
+end
 
-function register_root_module(m::Module)
+function register_root_module(m::Module, key::PkgId=PkgId(m))
     assert_havelock(require_lock)
-    key = PkgId(m, String(nameof(m)))
     if haskey(loaded_modules, key)
         oldm = loaded_modules[key]
         if oldm !== m
@@ -1081,7 +1083,6 @@ function register_root_module(m::Module)
         end
     end
     loaded_modules[key] = m
-    module_keys[m] = key
     nothing
 end
 
@@ -1103,9 +1104,8 @@ loaded_modules_array() = @lock require_lock collect(values(loaded_modules))
 function unreference_module(key::PkgId)
     if haskey(loaded_modules, key)
         m = pop!(loaded_modules, key)
-        # need to ensure all modules are GC rooted; will still be referenced
-        # in module_keys
     end
+    nothing
 end
 
 # Returns `nothing` or the name of the newly-created cachefile
@@ -1184,10 +1184,10 @@ function _require(pkg::PkgId)
         if uuid !== nothing
             ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2, UInt64}), newm, uuid)
         end
-        register_root_module(newm)
+        register_root_module(newm, pkg)
         unlock(require_lock)
         try
-            include(newm, path)
+            eval(newm, :(baremodule $(nameof(newm)); $include($newm, $path); end))
         finally
             lock(require_lock)
         end
@@ -1353,11 +1353,12 @@ function include_package_for_output(pkg::PkgId, input::String, depot_path::Vecto
     uuid = pkg.uuid
     if uuid !== nothing
         ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2, UInt64}), newm, uuid)
+        # HACK for preferences
         ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2, UInt64}), Main, uuid)
     end
-    @lock require_lock register_root_module(newm)
+    @lock require_lock register_root_module(newm, pkg)
     try
-        include(newm, input)
+        eval(newm, :(baremodule $(nameof(newm)); $include($newm, $input); end))
     catch ex
         precompilableerror(ex) || rethrow()
         @debug "Aborting `create_expr_cache'" exception=(ErrorException("Declaration of __precompile__(false) not allowed"), catch_backtrace())

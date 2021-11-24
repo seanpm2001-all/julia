@@ -56,15 +56,15 @@ precompile_test_harness(false) do dir
           """)
     write(Foo2_file,
           """
-          module $Foo2_module
-              export override
-              override(x::Integer) = 2
-              override(x::AbstractFloat) = Float64(override(1))
-          end
+          using Base
+          export override
+          override(x::Integer) = 2
+          override(x::AbstractFloat) = Float64(override(1))
           """)
     write(Foo_file,
           """
           module $Foo_module
+          baremodule $Foo_module
               import $FooBase_module, $FooBase_module.typeA
               import $Foo2_module: $Foo2_module, override
               import $FooBase_module.hash
@@ -196,6 +196,7 @@ precompile_test_harness(false) do dir
 
               # check that @ccallable works from precompiled modules
               Base.@ccallable Cint f35014(x::Cint) = x+Cint(1)
+          end
           end
           """)
     # make sure `sin` didn't have a kwfunc (which would invalidate the attempted test)
@@ -481,7 +482,7 @@ precompile_test_harness(false) do dir
           error("break me")
           end
           """)
-    @test_warn r"LoadError: break me\nStacktrace:\n \[1\] [\e01m\[]*error" try
+    @test_warn r"LoadError: break me\nStacktrace:\n  \[1\] [\e01m\[]*error" try
             Base.require(Main, :FooBar2)
             error("the \"break me\" test failed")
         catch exc
@@ -493,7 +494,10 @@ precompile_test_harness(false) do dir
     FooBar3_file = joinpath(dir, "FooBar3.jl")
     FooBar3_inc = joinpath(dir, "FooBar3_inc.jl")
     write(FooBar3_inc, "x=1\n")
-    for code in ["Core.eval(Base, :(x=1))", "Base.include(Base, \"FooBar3_inc.jl\")"]
+    for code in [
+            "Core.eval(Main.Base, :(x=1))",
+            "using Base; Base.include(Base, \"FooBar3_inc.jl\")",
+            "using Base: @eval; @eval Main module Base end"]
         write(FooBar3_file, code)
         @test_warn "Evaluation into the closed module `Base` breaks incremental compilation" try
                 Base.require(Main, :FooBar3)
